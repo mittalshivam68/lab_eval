@@ -1,0 +1,300 @@
+import cudf
+import math
+from tqdm import tqdm
+
+import matplotlib.pyplot as plt
+from PIL import Image
+
+import os
+import os.path as osp
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.nn.modules.activation import ReLU
+from torch.nn.modules.batchnorm import BatchNorm2d
+
+import torchvision
+import torchvision.transforms as ttf
+from torch.utils.data import Dataset, DataLoader
+epochs = 10
+closs_weight = 0.001
+batch_size = 256
+lr = 0.1
+TRAIN_DIR = "../input/11-785-s22-hw2p2-classification/classification/classification/train"
+VAL_DIR = "../input/11-785-s22-hw2p2-classification/classification/classification/dev"
+TEST_DIR = "../input/11-785-s22-hw2p2-classification/classification/classification/test"
+train_transforms = [ttf.Resize(255), ttf.CenterCrop(224), ttf.ToTensor(), ttf.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])]
+val_transforms = [ttf.Resize(255), ttf.CenterCrop(224), ttf.ToTensor(), ttf.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])]
+
+train_dataset = torchvision.datasets.ImageFolder(TRAIN_DIR, transform=ttf.Compose(train_transforms))
+val_dataset = torchvision.datasets.ImageFolder(VAL_DIR, transform=ttf.Compose(val_transforms))
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+val_loader = DataLoader(val_dataset, batch_size=batch_size,drop_last=True)
+class InvertedResidualBlock(nn.Module):
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 stride,
+                 expand_ratio):
+        super().__init__()
+        
+        if stride == 1 and in_channels == out_channels:
+            self.do_identity = True
+        else:
+            self.do_identity = False
+        
+        hidden_dim = in_channels * expand_ratio
+        
+        self.feature_mixing = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_dim, kernel_size= 1, stride = 1, padding = 0, bias = False),
+            nn.BatchNorm2d(hidden_dim),
+            nn.GELU()
+        )
+        
+        self.spatial_mixing = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size= 3, padding= 1, stride = stride, groups= hidden_dim,
+                      bias = False),
+            nn.BatchNorm2d(hidden_dim),
+            nn.GELU()
+        )
+
+        self.bottleneck_channels = nn.Sequential(
+            nn.Conv2d(hidden_dim, out_channels, kernel_size= 1, stride= 1, padding= 0, bias= False),
+            nn.BatchNorm2d(out_channels)
+        )
+
+    def forward(self, x):
+        out = self.feature_mixing(x)
+        out = self.spatial_mixing(out)
+        out = self.bottleneck_channels(out)
+
+        if self.do_identity:
+            return x + out
+        else:
+            return out
+
+class MobileNetV2(nn.Module):
+    def __init__(self, num_classes= 7000, feat_dim = 256):
+        super().__init__()
+
+        self.num_classes = num_classes
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size= 3, stride= 2, padding= 1, bias= False),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+            nn.Conv2d(32, 32, kernel_size= 3, stride=1 , padding= 1, groups= 32, bias= False),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+            nn.Conv2d(32, 16, kernel_size= 1, stride= 1, padding= 0, bias= False),
+            nn.BatchNorm2d(16)
+        )
+
+        self.stage_cfgs = [
+            [6,  24, 2, 2],
+            [6,  32, 3, 2],
+            [6,  64, 4, 2],
+            [6,  96, 3, 1]
+        ]
+        in_channels = 16
+
+        layers = []
+        for curr_stage in self.stage_cfgs:
+            expand_ratio, num_channels, num_blocks, stride = curr_stage
+            
+            for block_idx in range(num_blocks):
+                out_channels = num_channels
+                layers.append(InvertedResidualBlock(
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    stride=stride if block_idx == 0 else 1, 
+                    expand_ratio=expand_ratio
+                ))
+                in_channels = out_channels 
+            
+        self.layers = nn.Sequential(*layers)
+        
+        self.final_block = nn.Sequential(
+            nn.Conv2d(in_channels, 100, kernel_size=1, padding=0, stride=1, bias=False),
+            nn.BatchNorm2d(100),
+            nn.ReLU6()
+        )
+
+        self.cls_layer = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1,1)),
+            nn.Flatten(),
+            nn.Linear(100, num_classes)
+        )
+        
+        self.feats_layer = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1,1)),
+            nn.Flatten()
+        )     
+
+        self.loss_layer = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1,1)),
+            nn.Flatten(),
+            nn.Linear(100, feat_dim)
+        )
+
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                m.weight.data.normal_(0, math.sqrt(2. / n))
+                if m.bias is not None:
+                    m.bias.data.zero_()
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+            elif isinstance(m, nn.Linear):
+                m.weight.data.normal_(0, 0.01)
+                m.bias.data.zero_()
+
+    def forward(self,x, return_feats= False, return_embedding = False):
+        out = self.stem(x)
+        out = self.layers(out)
+        out = self.final_block(out)
+        
+        if return_embedding:
+          out2 = self.loss_layer(out)
+          out = self.cls_layer(out)
+          return out, out2
+        if return_feats:
+          out3 = self.feats_layer(out)
+          return out3
+class CenterLoss(nn.Module):
+    def __init__(self, num_classes, feat_dim, device=torch.device('cuda')):
+        super(CenterLoss, self).__init__()
+        self.num_classes = num_classes
+        self.feat_dim = feat_dim
+        self.device = device
+        
+        self.centers = nn.Parameter(torch.randn(self.num_classes, self.feat_dim).to(self.device))
+
+    def forward(self, x, labels):
+        batch_size = x.size(0)
+        distmat = torch.pow(x, 2).sum(dim=1, keepdim=True).expand(batch_size, self.num_classes) + \
+                  torch.pow(self.centers, 2).sum(dim=1, keepdim=True).expand(self.num_classes, batch_size).t()
+        distmat.addmm_(1, -2, x, self.centers.t())
+
+        classes = torch.arange(self.num_classes).long().to(self.device)
+        labels = labels.unsqueeze(1).expand(batch_size, self.num_classes)
+        mask = labels.eq(classes.expand(batch_size, self.num_classes))
+
+        dist = []
+        for i in range(batch_size):
+            value = distmat[i][mask[i]]
+            value = value.clamp(min=1e-12, max=1e+12)
+            dist.append(value)
+        dist = torch.cat(dist)
+        loss = dist.mean()
+
+        return loss
+model = MobileNetV2()
+model.cuda()
+num_trainable_parameters = 0
+for p in model.parameters():
+    num_trainable_parameters += p.numel()
+print("Number of Params: {}".format(num_trainable_parameters))
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+num_classes = len(train_dataset.classes)
+feat_dim = 256
+criterion_label = torch.nn.CrossEntropyLoss()
+criterion_closs = CenterLoss(num_classes, feat_dim, device)
+criterion = torch.nn.CrossEntropyLoss() 
+optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=1e-4)
+scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=(len(train_loader) * epochs))
+scaler = torch.cuda.amp.GradScaler()
+
+def valid(model, val_loader):
+    model.eval()
+    
+    num_correct = 0
+    for i, (x, y) in enumerate(val_loader):
+
+        x = x.cuda()
+        y = y.cuda()
+
+        with torch.no_grad():
+            outputs, features = model(x, return_embedding = True)
+
+        num_correct += int((torch.argmax(outputs, axis=1) == y).sum())
+       
+    valid_acc = 100 * num_correct / len(val_dataset)
+    return valid_acc
+
+for epoch in range(1, epochs +1):
+    model.train()
+    
+    num_correct = 0
+    total_loss = 0
+
+    for i, (x, y) in enumerate(train_loader):
+        optimizer.zero_grad()
+
+        x = x.cuda()
+        y = y.cuda()
+        
+        with torch.cuda.amp.autocast():     
+            outputs, features = model(x, return_embedding = True)
+            l_loss = criterion_label(outputs, y)
+            c_loss = criterion_closs(features.float(), y)
+            loss = l_loss + closs_weight * c_loss
+          
+        num_correct += int((torch.argmax(outputs, axis=1) == y).sum())
+        total_loss += float(loss)
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        scheduler.step()
+    
+    valid_acc = valid(model, val_loader)
+    
+    print('Iteration:',str(epoch))
+    
+class ClassificationTestSet(Dataset):
+    def __init__(self, data_dir, transforms):
+        self.data_dir = data_dir
+        self.transforms = transforms
+        self.img_paths = list(map(lambda fname: osp.join(self.data_dir, fname), sorted(os.listdir(self.data_dir))))
+
+    def __len__(self):
+        return len(self.img_paths)
+    
+    def __getitem__(self, idx):
+        return self.transforms(Image.open(self.img_paths[idx]))
+test_dataset = ClassificationTestSet(TEST_DIR, ttf.Compose(val_transforms))
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
+                         drop_last=False, num_workers=1)
+#torch.save(model.state_dict(), './model')
+"""
+device = torch.device("cuda")
+model = MobileNetV2()
+model.load_state_dict(torch.load('../input/dslab/model'))
+#model.to(device)
+"""
+model.eval()
+img_path_list = list(test_dataset.img_paths)
+res = []
+names = []
+for i, (x) in enumerate(test_loader):
+    x = x.cuda()
+    with torch.no_grad():
+        outputs = model(x,return_embedding=True)[0]
+    pred_y = torch.argmax(outputs, axis=1)
+    res.extend(pred_y.tolist())
+id = []
+for i in range(len(test_dataset)):
+    id.append(str(i).zfill(6)+".jpg")
+output = cudf.DataFrame({'id': id, 'label': res})
+output.to_csv('submission.csv', index=False)
+print("Your submission was successfully saved!")
+output
+ 
